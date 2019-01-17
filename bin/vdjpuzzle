@@ -1,0 +1,693 @@
+#!/bin/bash
+
+# THIS VERSION IS A COPY OF THE LATEST VERSION AT 3 June 2017, AND MADE FOR RAIJIN
+
+set -x # echo on, command fails causes script to exit, pipes fail
+
+# get the directory of the current script
+# from https://stackoverflow.com/questions/59895/getting-the-source-directory-of-a-bash-script-from-within
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
+  DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+
+# set relative directory variables
+BIN_DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+SCRIPTS_DIR=$BIN_DIR/../scripts
+SHARE_DIR=$BIN_DIR/../share
+
+
+# If conda_prefix has not been setup, then we are not in the vdjpuzzle environment and need to activate it.
+if [[ -z ${CONDA_PREFIX+x} ]]; then
+	CURDIR="$PWD"
+	cd $BIN_DIR/../
+	source activate vdjpuzzle
+	cd $CURDIR
+fi
+# If conda_prefix still does not exist, environment hasn't been created - leave this to the user.
+if [[ -z ${CONDA_PREFIX+x} ]]; then
+	echo "Unable to activate vdjpuzzle conda environment, ensure that you have created the environment correctly - see README.md"
+	exit
+fi
+
+
+>&2 echo "Running VDJPuzzle executable from directory: $BIN_DIR"
+>&2 echo "Running on date: " `date`
+
+function printHelp {
+	>&2 echo "VDJPuzzle v2.0"
+	>&2 echo "Usage: ./vdjpuzzle directory_name --bowtie-index=/path/to/index/index_prefix --gtf=/path/to/gtf_file.gtf [options]"
+	>&2 echo -e "--qsub\texecutes on the cluster (overrides --CPU flag)"
+	>&2 echo -e "--type=(t|b)\tspecifies tcell (default) or bcell analysis"
+	>&2 echo -e "--CPU=n\truns with n processes"
+	>&2 echo -e "--THR=n\truns bowtie and tophat with n threads (default 8)"
+	>&2 echo -e "--species=(human|mouse)\tspecified human (default) or mouse organism"
+	>&2 echo -e "--no-err-corr\tDo not perform final error correction on consensus sequence"
+	>&2 echo -e "--only-statistics\tExecutes only summary statistics script"
+	>&2 echo -e "--no-statistics\tDo not execute summary statistics script"
+	>&2 echo -e "--transcriptomic\tEnable cuffquant/cuffnorm gene quantification measurements"
+	>&2 echo -e "--trim\tTrim reads using Trimmomatic"
+	>&2 echo -e "--trim-galore\tTrim reads using Trim galore"
+	>&2 echo -e "--counts\tEnable featureCounts gene quantification measurements"
+	>&2 echo -e "--sra\tFastq files have been downloaded using SRA. Please ensure they have been downloaded using a command structure similar to the following: SRA_TOOLKIT/fastq-dump --defline-seq "'@$sn[_$rn]/$ri'" --split-files file.sra"
+}
+
+function testArg {
+	if [[ "$1" =~ $2 ]]; then
+		local result='true'
+	else
+		local result='false'
+	fi
+	echo "$result"
+}
+
+function waitForProcess {
+	sleep_time=120
+	status=`qstat -u $USER 2>&1 | grep "p${1}_${2}\|cannot connect to server\|errno="`
+	while [[ -n "${status}" ]] # while $status is not empty
+	do
+		sleep $sleep_time
+		status=`qstat -u $USER 2>&1 | grep "p${1}_${2}\|cannot connect to server\|errno="`
+	done
+}
+
+#CONFIGURE SCRIPT PATHS
+export MIGMAP=`which migmap` #/short/va1/fzl561/scRNAseq/Tools/migmap-0.9.7/migmap-0.9.7.jar
+export trinitypath=`which Trinity` #/short/va1/fzl561/scRNAseq/Tools/trinityrnaseq-2.0.6/Trinity
+export TOPHAT=`which tophat2` # /apps/tophat/2.0.7/tophat2
+export BOWTIE=`which bowtie2` # /apps/bowtie2/2.1.0/bowtie2
+export BOWTIEBUILD=`which bowtie2-build` # /apps/bowtie2/2.1.0/bowtie2-build
+export SAMTOOLS=`which samtools` # /apps/samtools/0.1.18/bin/samtools
+export BEDTOOLS=`which intersectBed` # /apps/bedtools/2.26.0/bin/intersectBed
+export featureCounts=`which featureCounts` # /short/va1/fzl561/scRNAseq/Tools/subread/subread-1.5.1-Linux-x86_64/bin/featureCounts
+if [[ ! -z ${CONDA_PREFIX+x} ]]; then
+	export TRIMMOMATIC=`which trimmomatic` # /short/va1/fzl561/scRNAseq/Tools/Trimmomatic-0.36/trimmomatic-0.36.jar
+else
+	export TRIMMOMATIC=/short/va1/fzl561/scRNAseq/Tools/Trimmomatic-0.36/trimmomatic-0.36.jar
+fi
+
+### TRIMMING PARAMETERS ###
+if [[ ! -z ${CONDA_PREFIX+x} ]]; then
+	export ADAPTERS=${CONDA_PREFIX}/share/trimmomatic/adapters/NexteraPE-PE.fa
+else
+	export ADAPTERS=$(echo $TRIMMOMATIC | egrep -o ".*\/")adapters/NexteraPE-PE.fa
+fi
+export LEADING=3
+export TRAILING=3
+export WINDOW_LEN=4
+export WINDOW_QUAL=15
+export MINLEN=50
+export AVGQUAL=20
+
+#SET DEFAULT PARAMETERS
+PARALLEL=1
+NOERRCORR=0
+NTHREADS=1
+USE_MIGMAP_DETAILS=1
+COUNTS=0
+SRA=0
+RUNTCR=1
+RUNR=1
+ORGANISM=human
+TRIM=0
+TRIMG=0
+QSUB=0
+TRANSCRIPTOMIC=0
+TYPE='t'
+
+# make log directory
+mkdir -p log
+
+#PARSING PARAMETERS
+for i in "$@"
+do
+	case $i in
+		-h|--help)
+		printHelp
+		exit 0
+		shift
+		;;
+
+		--qsub)
+		QSUB=1
+		shift
+		;;
+
+		--sra)
+		SRA=1
+		echo -e "Assuming SRA files have been downloaded as follows:\n\n\tSRA_TOOLKIT/fastq-dump --defline-seq "'@$sn[_$rn]/$ri'" --split-files file.sra"
+		echo -e "\nThis is required for Trinity."
+		shift
+		;;
+
+		--type=*)
+		TYPE="${i#*=}"
+		if [[ "$(testArg $TYPE '^[tb]$')" != "true" ]]; then
+			printHelp
+			exit
+		fi
+		shift
+		;;
+
+		--CPU=*)
+		PARALLEL="${i#*=}"
+		if [[ "$(testArg $PARALLEL '^[0-9]+$')" != "true" ]]; then
+			printHelp
+			exit
+		fi
+		shift
+		;;
+
+		--THR=*)
+		NTHREADS="${i#*=}"
+		if [[ "$(testArg $NTHREADS '^[0-9]+$')" != "true" ]]; then
+			printHelp
+			exit
+		fi
+		shift
+		;;
+
+		--only-statistics)
+		RUNTCR=0
+		shift
+		;;
+
+		--species=*)
+		ORGANISM="${i#*=}"
+		if [[ "$(testArg $ORGANISM '(mouse|human)')" != "true" ]]; then
+			printHelp
+			exit
+		fi
+		shift
+		;;
+
+		--no-err-corr)
+		NOERRCORR=1
+		shift
+		;;
+
+		--transcriptomic)
+		TRANSCRIPTOMIC=1
+		shift
+		;;
+
+		--trim)
+		TRIM=1
+		shift
+		;;
+
+		--trim-galore)
+		TRIMG=1
+		shift
+		;;
+
+		--counts)
+		COUNTS=1
+		shift
+		;;
+
+		--no-statistics)
+		RUNR=0
+		shift
+		;;
+
+		--bowtie-index=*)
+		BOWTIE_INDEX="${i#*=}"
+		if [[ ! -f "${BOWTIE_INDEX}.1.bt2" || -z ${BOWTIE_INDEX+x} ]]; then
+			>&2 echo "Error: could not find index at ${BOWTIE_INDEX}.1.bt2"
+			printHelp
+			exit 1
+		fi
+		export BOWTIE_INDEX
+		# default /short/va1/fzl561/scRNAseq/refGenome/$ORGANISM/Bowtie2Index/genome
+		shift
+		;;
+
+		--gtf=*)
+		ANNOTATION="${i#*=}"
+		if [[ ! -f "${ANNOTATION}" || -z ${ANNOTATION+x} ]]; then
+			>&2 echo "Error: could not find GTF annotation at ${ANNOTATION}."
+			printHelp
+			exit 1
+		fi
+		export ANNOTATION
+		# default /short/va1/fzl561/scRNAseq/refGenome/$ORGANISM/Genes/genes.gtf
+		shift
+		;;
+
+		*)
+
+		if [[ ! -d "$i" ]]; then
+			echo "Invalid SC_RNA_SEQ directory: $i"
+			printHelp
+			exit
+		fi
+		echo "SC_RNA_SEQ Directory $i"
+		RNADIR=$i
+		shift
+		;;
+	esac
+done
+
+if [[ -z "$RNADIR" ]]; then
+	echo "VDJPuzzle requires a positional argument, directory_name."
+	printHelp
+	exit 1
+fi
+
+if [[ -z "$BOWTIE_INDEX" ]]; then
+	echo "No bowtie index path provided, please specify one with the option --bowtie-index=/path/to/index/index_prefix"
+	exit 1
+fi
+
+if [[ -z "$ANNOTATION" ]]; then
+	echo "No gene annotation file provided, please specify one with the option --gtf=/path/to/gtf_file.gtf"
+	exit 1
+fi
+
+#CONFIGURE REFERENCE PATHS
+if [ "$TYPE" == "t" ]; then
+	CHAIN_ARRAY=('TCRA' 'TCRB')
+	CHAIN_PREFIX_ARRAY=('a' 'b')
+else
+	CHAIN_ARRAY=('IGH' 'IGK' 'IGL')
+	CHAIN_PREFIX_ARRAY=('h' 'k' 'l')
+fi
+
+for chain in "${CHAIN_ARRAY[@]}"
+do
+	export $chain=$SHARE_DIR/bed_files/${chain//C}_${ORGANISM}.bed
+done
+
+export CUFFOUTPUT=$PWD/CuffQuant
+export COUNTOUTPUT=$PWD/ReadCounts
+
+echo "parallel = $PARALLEL
+qsub = $QSUB
+threads = $NTHREADS
+counts = $COUNTS
+organism = $ORGANISM
+runtcr = $RUNTCR
+runr = $RUNR
+trim = $TRIM
+type = $TYPE
+transcriptomic = $TRANSCRIPTOMIC
+chain_array = ${CHAIN_ARRAY[*]}
+chain_prefix_array = ${CHAIN_PREFIX_ARRAY[*]}"
+
+RECEPTOR_ABBREV="$(echo $TYPE | tr '[:lower:]' '[:upper:]')CR"
+
+#MAKE SURE TO HAVE THE ABSOLUTE PATH WITHOUT / AT THE END
+CURDIR="$PWD"
+cd $RNADIR
+RNADIR="$PWD"
+cd $CURDIR
+
+
+if [ "$TRANSCRIPTOMIC" -ge 1 ]; then
+	mkdir -p $CUFFOUTPUT
+	echo "Transcriptomic quantification"
+	echo -e "sample_name\tgroup" > $CUFFOUTPUT/sample_sheet.txt
+fi
+
+
+echo "STARTING PART 1 : Geneating preliminary VDJ repertoire"
+#PART1 - GENERATE PRELIMINARY VDJ REPERTOIRE
+if [[ $QSUB -ge 1 ]] ; then
+	N=1
+	for d in $RNADIR/*
+	do
+		echo $d
+		di=${d%%/};
+		echo $di
+		nfiles=$(find -L $di/*fastq* -type f | wc -l)
+		if [ "$nfiles" -ge 2 ]; then
+			filename=$(basename $di)
+			qsub -N "p1_${TYPE}_$N" -e "log/p1_${TYPE}_$N.err" -o "log/p1_${TYPE}_$N.out" -V -v P1=$di,P2=$filename,P3=$ORGANISM,P4=$PWD,P5=$TRANSCRIPTOMIC,P6=$TRIM,P7="${CHAIN_ARRAY[*]}",P8="${CHAIN_PREFIX_ARRAY[*]}",P9=$NTHREADS,P10=$USE_MIGMAP_DETAILS,P11=$TRIMG,P12=$SRA,PATH_PARAM=$PATH $SCRIPTS_DIR/run_part1.sh
+		fi
+		N=$((N+1))
+	done
+	waitForProcess 1 $TYPE
+
+else
+	N=0
+	for d in $RNADIR/*
+	do
+		echo $d
+		di=${d%%/};
+		echo $di
+		nfiles=$(find -L $di/*fastq* -type f | wc -l)
+		if [ "$nfiles" -ge 2 ]; then
+			filename=$(basename $di)
+			if (( $N % $PARALLEL == 0 )) ; then
+				wait
+			fi
+			$SCRIPTS_DIR/run_part1.sh $di $filename $ORGANISM $PWD $TRANSCRIPTOMIC $TRIM "${CHAIN_ARRAY[*]}" "${CHAIN_PREFIX_ARRAY[*]}" $NTHREADS $USE_MIGMAP_DETAILS $TRIMG $SRA &
+		fi
+		N=$((N+1))
+	done
+	wait
+fi
+
+if [ "$TRANSCRIPTOMIC" -ge 1 ]; then
+	find "$CUFFOUTPUT"/* -type d -exec echo -ne "{}/abundances.cxb\t" \; -exec sh -c "echo {} | sed 's/.*\///'" \; >> $CUFFOUTPUT/sample_sheet.txt
+	if [[ $QSUB -ge 1 ]] ; then
+		qsub -N "pcuff_${TYPE}_cuffnorm" -e "log/pcuff_${TYPE}_cuffnorm.err" -o "log/pcuff_${TYPE}_cuffnorm.out" -V -v ANNOTATION=$ANNOTATION,CUFFOUTPUT=$CUFFOUTPUT,PATH_PARAM=$PATH $SCRIPTS_DIR/run_cuffnorm.sh
+	else
+		cuffnorm --use-sample-sheet -o CuffNorm $ANNOTATION $CUFFOUTPUT/sample_sheet.txt
+	fi
+fi
+
+if [ -d preliminary ]; then
+	rm -rf preliminary
+fi
+
+mkdir -p preliminary
+mv VDJ_p1* preliminary/
+
+if [ "$COUNTS" -ge 1 ]; then
+	mkdir -p $COUNTOUTPUT
+	find preliminary -name 'accepted_hits.bam' -type f > $COUNTOUTPUT/bam_files.txt
+	mapfile -t <$COUNTOUTPUT/bam_files.txt
+	featureCounts --primary -a $ANNOTATION -o "$COUNTOUTPUT/featureCounts.csv" "${MAPFILE[@]}"
+	sed 1d "$COUNTOUTPUT/featureCounts.csv" | cut -f1,7- | sed s/Geneid/id/ > "$COUNTOUTPUT/featureCounts_formatted.csv"
+fi
+
+echo "PART 1 COMPLETE: Preliminary $RECEPTOR_ABBREV repertoire reconstructed."
+
+echo "STARTING PART 2: Building a new reference geonme based on the preliminary repertoire"
+#PART2 - BUILD A NEW REFERENCE GENOME BASED ON THE PRELIMINARY REPERTOIRE
+for chain_prefix in "${CHAIN_PREFIX_ARRAY[@]}"
+do
+	if [[ -f all_sequences_${chain_prefix}.fa ]]; then
+		rm -f all_sequences_${chain_prefix}.fa
+	fi;
+done
+
+if [[ $QSUB -ge 1 ]] ; then
+	N=1
+	for d in $PWD/preliminary/*
+	do
+		echo $d
+		di=${d%%/};
+		echo $di
+		nfiles=$(find -L $di/*fastq* -type f | wc -l)
+		if [ "$nfiles" -ge 2 ]; then
+			filename=$(basename $di)
+			qsub -N "p2_${TYPE}_$N" -e "log/p2_${TYPE}_$N.err" -o "log/p2_${TYPE}_$N.out" -V -v P1=$di,P2=$ORGANISM,P3=$PWD,P4=$N,P5="${CHAIN_ARRAY[*]}",P6="${CHAIN_PREFIX_ARRAY[*]}",PATH_PARAM=$PATH $SCRIPTS_DIR/run_part2.sh
+		fi
+		N=$((N+1))
+	done
+	waitForProcess 2 $TYPE
+
+else
+	N=0
+	for d in $PWD/preliminary/*
+	do
+		echo $d
+		di=${d%%/};
+		echo $di
+		nfiles=$(find -L $di/*fastq* -type f | wc -l)
+		if [ "$nfiles" -ge 2 ]; then
+			filename=$(basename $di)
+			if (( $N % $PARALLEL == 0 )) ; then
+				wait
+			fi
+			$SCRIPTS_DIR/run_part2.sh $di $ORGANISM $PWD $N "${CHAIN_ARRAY[*]}" "${CHAIN_PREFIX_ARRAY[*]}" &
+			N=$((N+1))
+		fi
+	done
+	wait
+fi
+
+
+for chain_prefix in "${CHAIN_PREFIX_ARRAY[@]}"
+do
+	cat matching_reads_${chain_prefix}_* > all_sequences_${chain_prefix}.fa
+done
+
+index=0
+for chain in "${CHAIN_ARRAY[@]}"
+do
+	bowtie2-build -f all_sequences_${CHAIN_PREFIX_ARRAY[$index]}.fa $chain
+	index=$((index+1))
+done
+
+mkdir -p assembled${RECEPTOR_ABBREV}_genome
+mv *.bt2 assembled${RECEPTOR_ABBREV}_genome/
+
+mkdir -p summary2
+mv summary/* summary2/
+
+echo "PART 2 COMPLETE: Finished building reference genome"
+
+
+echo "STARTING PART 3: Realigning reads to newly constructed genome"
+#PART3
+if [[ $QSUB -ge 1 ]] ; then
+	N=1
+	for d in $RNADIR/*
+	do
+		echo $d
+		di=${d%%/};
+		echo $di
+		nfiles=$(find -L $di/*fastq* -type f | wc -l)
+		if [ "$nfiles" -ge 2 ]; then
+			filename=$(basename $di)
+			qsub -N "p3_${TYPE}_$N" -e "log/p3_${TYPE}_$N.err" -o "log/p3_${TYPE}_$N.out" -V -v P1=$di,P2=$filename,P3=$ORGANISM,P4=$PWD,P5=$TRIM,P6="${CHAIN_ARRAY[*]}",P7="${CHAIN_PREFIX_ARRAY[*]}",P8=$NTHREADS,P9="$RECEPTOR_ABBREV",P10=$USE_MIGMAP_DETAILS,P11=$TRIMG,PATH_PARAM=$PATH $SCRIPTS_DIR/run_part3.sh
+			N=$((N+1))
+		fi
+	done
+	waitForProcess 3 $TYPE
+
+else
+	N=0
+	for d in $RNADIR/*
+	do
+		echo $d
+		di=${d%%/};
+		echo $di
+		nfiles=$(find -L $di/*fastq* -type f | wc -l)
+		if [ "$nfiles" -ge 2 ]; then
+			filename=$(basename $di)
+			if (( $N % $PARALLEL == 0 )) ; then
+				wait
+			fi
+			$SCRIPTS_DIR/run_part3.sh $di $filename $ORGANISM $PWD $TRIM "${CHAIN_ARRAY[*]}" "${CHAIN_PREFIX_ARRAY[*]}" $NTHREADS $RECEPTOR_ABBREV $USE_MIGMAP_DETAILS $TRIMG &
+			N=$((N+1))
+		fi
+	done
+	wait
+fi
+
+rm -r ${RECEPTOR_ABBREV}sequences
+mkdir -p ${RECEPTOR_ABBREV}sequences
+mv VDJ_p3* ${RECEPTOR_ABBREV}sequences/
+
+echo "PART 3 COMPLETE: Reads aligned and receptor repertoires assembled"
+
+echo "Compiling results"
+
+# UPDATE SUMMARY FOLDER WITH LATEST
+echo '#!/bin/bash' > mv${RECEPTOR_ABBREV}.sh
+for chain in "${CHAIN_ARRAY[@]}"
+do
+	# find summary2 -name "${chain//C}_*" -exec awk 'END { if (NR > 1) print "mv " FILENAME " summary/" }' {} \; >> mv${RECEPTOR_ABBREV}.sh
+	for file in $(find summary2 -name "${chain//C}_*")
+	do 
+		if [[ $(cat $file | wc -l) -gt 1 ]]; then
+			echo "mv $file summary/" >> mv${RECEPTOR_ABBREV}.sh
+			echo "mv preliminary/$(basename $file | sed 's/^\(TRA\|TRB\|IGH\|IGK\|IGL\)_/VDJ_p1_/')/$chain.fa ${RECEPTOR_ABBREV}sequences/$(basename $file | sed 's/^\(TRA\|TRB\|IGH\|IGK\|IGL\)_/VDJ_p3_/')/$chain.fa" >> mv${RECEPTOR_ABBREV}.sh
+		fi
+	done
+done
+chmod a+x mv${RECEPTOR_ABBREV}.sh
+./mv${RECEPTOR_ABBREV}.sh
+
+
+if [ "$RUNR" -ge 1 ]; then
+
+	index=0
+	for chain in "${CHAIN_ARRAY[@]}"
+	do
+		cat summary/${chain//C}* > summary/h${index}.txt
+		head -1 summary/h${index}.txt > summary/header${index}.txt
+		rm summary/${chain//C}tmp.txt
+		rm summary/${chain//C}_cells.txt
+		rm summary/${chain//C}.csv
+
+		for tcr in summary/${chain//C}*;
+		do
+			if [ "$(cat $tcr | wc -l)" -ge 2 ]; then
+				number="$(cat $tcr | wc -l)"
+				number="$(expr $number - 1)"
+				for i in `seq $number`; do
+					echo ${tcr##*/} >> summary/${chain//C}_cells.txt
+				done
+				tail -n +2 $tcr >> summary/${chain//C}tmp.txt
+			fi
+		done
+
+		cat summary/header${index}.txt summary/${chain//C}tmp.txt > summary/single_cells_${chain//C}.txt
+		echo "CellID" > summary/single_cells_ID_${chain//C}.txt
+		cat summary/${chain//C}_cells.txt >> summary/single_cells_ID_${chain//C}.txt
+		paste -d"\t" summary/single_cells_ID_${chain//C}.txt summary/single_cells_${chain//C}.txt > summary/${chain//C}.csv
+		rm summary/h${index}.txt
+		rm summary/header${index}.txt
+		rm summary/${chain//C}tmp.txt
+		rm summary/${chain//C}_cells.txt
+		rm summary/single_cells_${chain//C}.txt
+		rm summary/single_cells_ID_${chain//C}.txt
+		index=$((index+1))
+	done
+fi
+
+# wait for cuffnorm to finish
+waitForProcess cuff $TYPE
+
+if [[ $NOERRCORR -lt 1 ]] ; then
+	# ERROR CORRECTION
+	# Requires fasta file of reference (reconstructed) sequences and paired end reads
+	# Will run migmap, take identified sequences, align reads and produce the corrected consensus sequence
+
+    if [[ -e "$CURDIR/summary_corrected" ]]
+    then
+			echo "summary_corrected directory already exits, removing it"
+			rm -vr "$CURDIR/summary_corrected"
+    fi
+	mkdir "$CURDIR/summary_corrected"
+
+	echo -e "CellID\tSequence name\t#reads" > "$CURDIR/${RECEPTOR_ABBREV}_expression.tsv"
+	for chain in "${CHAIN_ARRAY[@]}"
+	do
+		R1="reads_${chain}_1.fastq"
+		R2="reads_${chain}_2.fastq"
+
+		# create directory for storing results
+		OUTPUT=$CURDIR/"$(echo ${chain//c} | tr '[:upper:]' '[:lower:]')"_err_corr
+		if [[ -e $OUTPUT ]]
+		then
+			echo "Output directory already exits, removing it"
+			rm -vr $OUTPUT
+		fi
+		mkdir $OUTPUT
+
+		for cell in $CURDIR/${RECEPTOR_ABBREV}sequences/*
+		do
+			# read original data
+			ALL_FASTA="$cell/${chain}.fa"
+			READS_1="$cell/$R1"
+			READS_2="$cell/$R2"
+
+			# skip the case/cell where a directory does not have required files
+			if [ ! -e $ALL_FASTA -o ! -e $READS_1 -o ! -e $READS_2 ]
+			then
+				echo "Reference file and/or reads were not found ... moving to next cell."
+				continue
+			fi
+
+			# create subdirectory for each cell analysed
+			mkdir $OUTPUT/$(basename $cell)
+			cd $OUTPUT/$(basename $cell)
+
+			# construct path for final output file
+			CORR_SEQ=$OUTPUT/$(basename $cell)/new_${chain}.fa
+			rm -vf accepted_seq_names.txt
+
+			# first tab delimited entry from migmap is the sequence name
+			# create a file with names of identified sequences
+			migmap -S $ORGANISM --by-read -R ${chain//C} --data-dir=$CONDA_PREFIX/share/igblast $ALL_FASTA - | cut -f1 | egrep "^>.*" >> accepted_seq_names.txt
+
+			rm -vrf $CORR_SEQ
+
+			# go through identified sequences and use as reference for alignment
+			while read seq_name; do
+
+				seq_name_prefix=$(echo $seq_name | egrep -o "^>[^[:space:]]+")
+				# create a fasta reference file with a single sequence, index it as required
+				python $SCRIPTS_DIR/extract_fasta.py "$seq_name" $ALL_FASTA # creates reference.fasta
+				samtools faidx reference.fasta
+				bwa index reference.fasta
+
+				# samtools v1.3.1
+				bwa mem reference.fasta $READS_1 $READS_2 | samtools view -b | samtools sort -o alignment.bam
+
+				samtools index alignment.bam
+				echo "samtools index finished"
+
+				# Get the number of reads
+				readcount=$(samtools view -F 0x4 alignment.bam | cut -f 1 | sort | uniq | wc -l)
+				echo -e "${chain//C}_$(basename $cell | sed 's/VDJ_p3_//')\t$seq_name_prefix\t$readcount" >> $CURDIR/${RECEPTOR_ABBREV}_expression.tsv
+
+				samtools mpileup -uf reference.fasta alignment.bam |
+
+				bcftools call -c --skip-variants | python $SCRIPTS_DIR/mpileup2cons.py reference.fasta
+
+				echo "writing sequence to file ..."
+				cat new_reference.fasta >> $CORR_SEQ
+				echo -e "Output located at:\n"$CORR_SEQ
+
+				# Even if we don't remove, they will be overwritten when the next sequence is processed.
+				rm -vf new_reference.fasta
+				rm -vf reference.fasta*
+				rm -vf alignment.bam*
+
+				echo "Done, moving to next sequence"
+
+			done <accepted_seq_names.txt
+			rm -vf accepted_seq_names.txt
+
+			if [[ $USE_MIGMAP_DETAILS -ge 1 ]] ; then 
+				migmap -S $ORGANISM -R ${chain//C} --data-dir=$CONDA_PREFIX/share/igblast --details fr1nt,cdr1nt,fr2nt,cdr2nt,fr3nt,fr4nt $CORR_SEQ $CURDIR/summary_corrected/${chain//C}_$(basename $cell | sed 's/^VDJ_p3_//g')
+			else
+				migmap -S $ORGANISM -R ${chain//C} --data-dir=$CONDA_PREFIX/share/igblast $CORR_SEQ $CURDIR/summary_corrected/${chain//C}_$(basename $cell | sed 's/^VDJ_p3_//g')
+			fi
+
+			echo "Done, moving to next cell"
+		done
+	done
+
+	cd $CURDIR
+	
+	if [ "$RUNR" -ge 1 ]; then
+		index=0
+		for chain in "${CHAIN_ARRAY[@]}"
+		do
+			cat summary_corrected/${chain//C}* > summary_corrected/h${index}.txt
+			head -1 summary_corrected/h${index}.txt > summary_corrected/header${index}.txt
+			rm summary_corrected/${chain//C}tmp.txt
+			rm summary_corrected/${chain//C}_cells.txt
+			rm summary_corrected/${chain//C}.csv
+
+			for tcr in summary_corrected/${chain//C}*;
+			do
+				if [ "$(cat $tcr | wc -l)" -ge 2 ]; then
+					number="$(cat $tcr | wc -l)"
+					number="$(expr $number - 1)"
+					for i in `seq $number`; do
+						echo ${tcr##*/} >> summary_corrected/${chain//C}_cells.txt
+					done
+					tail -n +2 $tcr >> summary_corrected/${chain//C}tmp.txt
+				fi
+			done
+
+			cat summary_corrected/header${index}.txt summary_corrected/${chain//C}tmp.txt > summary_corrected/single_cells_${chain//C}.txt
+			echo "CellID" > summary_corrected/single_cells_ID_${chain//C}.txt
+			cat summary_corrected/${chain//C}_cells.txt >> summary_corrected/single_cells_ID_${chain//C}.txt
+			paste -d"\t" summary_corrected/single_cells_ID_${chain//C}.txt summary_corrected/single_cells_${chain//C}.txt > summary_corrected/${chain//C}.csv
+			rm summary_corrected/h${index}.txt
+			rm summary_corrected/header${index}.txt
+			rm summary_corrected/${chain//C}tmp.txt
+			rm summary_corrected/${chain//C}_cells.txt
+			rm summary_corrected/single_cells_${chain//C}.txt
+			rm summary_corrected/single_cells_ID_${chain//C}.txt
+			index=$((index+1))
+		done
+	fi
+fi
+
+
+echo "${RECEPTOR_ABBREV} identification complete! Check your results in the summary_corrected directory."
+echo `date`
