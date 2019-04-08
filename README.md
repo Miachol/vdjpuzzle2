@@ -1,3 +1,5 @@
+**Please use the latest version of VDJPuzzle, available [here](https://bitbucket.org/kirbyvisp/vdjpuzzle).**
+
 # VDJPuzzle2 - README #
 
 TCR and BCR reconstruction from scRNA-seq data
